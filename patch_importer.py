@@ -16,6 +16,7 @@ import sys
 import os.path
 import shutil
 import tempfile
+import threading
 import time
 
 BASEDIR = os.path.dirname(__file__)
@@ -28,46 +29,47 @@ JOERN_PARSE_PATH = "/home/evonide/Desktop/Masterthesis/code/joern_dev/joern-pars
 PATCH_EXTRAPOLATION_DIRECTORY = "patch-extrapolation"
 PATCH_PARSED_DIRECTORY = "parsed"
 
+# Multithreading support.
+MAX_NUMBER_THREADS = 10
+
 DESCRIPTION = """Import all security patches from a specific directory/file and integrate those into the database."""
+
 
 class JoernImporter(OctopusImporter):
     def __init__(self, projectName, importSettings):
         self.importerPluginJSON = importSettings
         self.projectName = projectName
 
-class PATCHES():
-    def __init__(self, databaseName = 'octopusDB'):
-        self.argParser = ArgumentParser(description = DESCRIPTION)
-        self.argParser.add_argument('project')
-        # TODO: For now we are ignoring the databaseName in the init parameter. This should be adjusted.
-        self.argParser.add_argument(
-                "directory",
-                help = """The directory containing *.patch files.""")
 
-        self.args = self.argParser.parse_args()
-        self.projectName = self.args.project
+class PatchFileImporter():
+    def __init__(self, project_name, code_base_location, patch_filepath):
+        self.project_name = project_name
+        self.patch_filepath = patch_filepath
+        self.code_base_location = code_base_location
+        self.print_queue = []
+        self.buffer_output = True
 
-        # Setup
         self.j = PythonShellInterface()
-        self.j.setDatabaseName(self.projectName)
+        self.j.setDatabaseName(self.project_name)
+
+        self.temporary_directory_object = tempfile.TemporaryDirectory()
+        self.temporary_directory = self.temporary_directory_object.name
+
+    def _init_db(self):
         self.j.connectToDatabase()
-
         # Load additional groovy files
-        reload_dir(self.j.shell_connection, "steps")
+        # TODO: replace this ugly code once a nicer way to load steps is available.
+        for dirpath, dirnames, filenames in os.walk("steps"):
+            filenames[:] = [f for f in filenames if not f.startswith('.')]
+            for filename in filenames:
+                _, ext = os.path.splitext(filename)
+                if ext == ".groovy":
+                    with open(os.path.join(dirpath, filename), 'r') as f:
+                        self.j.shell_connection.run_command(f.read())
+        # ------------------------------------------------------------------------
 
-        # Get the current code base location.
-        # TODO: Is there no cleaner way to get the root element of a graph?
-        #self.code_base_location = self._query("queryNodeIndex('key:1').filepath")[0]
-        self.code_base_location = self._query("execSQLQuery('SELECT FROM #9:1').filepath")[0]
-
-        if not self.code_base_location:
-            raise Exception("[!] Couldn't retrieve the code base location.")
-
-        self._print_indented("[~] Using code base location: " + self.code_base_location)
-
-    def _query(self, query):
-        """Emit a Gremlin query."""
-        return self.j.runGremlinQuery(query)
+    def disable_message_buffering(self):
+        self.buffer_output = False
 
     def _print_indented(self, text, level=0, no_newline=0):
         """self._print_indented(the given text indented with 'level' many tabs.)
@@ -77,37 +79,182 @@ class PATCHES():
           level: int The number of tabs to write before the text.
           no_newline: int Avoid a newline at the end.
         """
+        new_message = ""
         for i in range (0, level):
-            sys.stdout.write("\t")
-        if no_newline:
-            sys.stdout.write(text)
+            new_message += "\t"
+        new_message += text
+        if not no_newline:
+            new_message += "\n"
+        self.print_queue.append(new_message)
+        if not self.buffer_output:
+            self.flush_message_queue()
+
+    def flush_message_queue(self):
+        for message in self.print_queue:
+            sys.stdout.write(message)
+            sys.stdout.flush()
+        self.print_queue = []
+
+    def _query(self, query):
+        """Emit a Gremlin query."""
+        return self.j.runGremlinQuery(query)
+
+    def import_patch_file(self):
+        """Import one single patch into the database.
+
+        Importing means:
+        1) Creating a new node for the patch (if it doesn't exist yet).
+        2) Dry applying this patch on the current code base (to get updated line offsets).
+        3) Parsing the patchfile and determining all effects.
+        4) Retrieving all nodes of affected source code from the database.
+        5) Showing some basic statistics about how well the patch could be integrated.
+
+        Args:
+          patch_filepath: str The patch's filepath.
+        """
+        # Initialize the database connection here since this method is started as one single thread.
+        self._init_db()
+
+        self._print_indented("[~] Importing: " + self.patch_filepath + " - ", 0, 1)
+
+        # Create a node for this patch if it doesn't already exist.
+        patch_description = 'Description tba.'
+        patch_node_id = self._query("createPatchNode('{}', '{}')".format(self.patch_filepath, patch_description))[0]
+
+        if not patch_node_id:
+            raise Exception("[!] Can't create a new node.")
+        if patch_node_id == "-1":
+            raise Exception("[!] A node for this patch existed more than once. Removed all instances. Please retry.")
+        self._print_indented("created/resolved (" + str(patch_node_id) + ")")
+
+        # Remove any previous operation and file nodes of this patch-node.
+        self._query("cleanupPatchEffects('" + str(patch_node_id) + "')")
+
+        # Parse the patch and read general information.
+        patches = PatchSet.from_filename(self.patch_filepath, encoding='utf-8')
+        number_of_patches = len(patches)
+        self._print_indented("[~] Patchfile consists of {} patch/es.".format(number_of_patches))
+
+        is_reversed_patch = False
+
+        # Iterate over all affected files and copy them into a temporary location.
+        # Copy all affected files into the temporary directory.
+        self._copy_affected_files(patches)
+
+        # Apply this patch to the temporary location.
+        # Fetch adjusted/fuzzed lines in case the patch doesn't match perfectly.
+        fuzzed_line_offsets = self._get_fuzzed_line_offsets(self.patch_filepath)
+        if fuzzed_line_offsets == -1:
+            # This seems to be a patch that should be applied in reverse.
+
+            # TODO: find a nicer solution than to copy all files again here to avoid side effects...
+            self._copy_affected_files(patches)
+
+            is_reversed_patch = True
+            fuzzed_line_offsets = self._get_fuzzed_line_offsets(self.patch_filepath, True)
+            self._print_indented("[!] This patch was already applied to the project. Treating as reversed patch.")
+
+        #print(temp_dir)
+        #time.sleep(30)
+
+        # Store some meta information about this patch.
+        self._query("g.v('{}').reversed = \"{}\"".format(patch_node_id, is_reversed_patch))
+        self._query("g.v('{}').numAffectedFiles = {}".format(patch_node_id, number_of_patches))
+
+        amount_patchfile_connected_nodes = 0
+        patch_i = -1
+        # Each patch refers to effects on one single file.
+        for patch in patches:
+            patch_i += 1
+
+            filepath = self.code_base_location + "/" + patch.path
+            number_of_hunks = len(patch)
+            self._print_indented("[->] " + filepath + " (" + str(number_of_hunks) + " hunk/s) - ", 1, 1)
+
+            # TODO: I have no idea why we need to do this. OrientDB is giving us a hard time with indices :(.
+            filepath = filepath[-100:]
+            results = self._query("queryFileByPath('{}', true).toList().id".format(filepath))
+            # TODO: remove this == [''] once the OrientDB Gremlin "List instead element" return mystery is resolved.
+
+            # Check if this file exists in the code base.
+            if len(results) == 0 or results == ['']:
+                self._print_indented("skipped (not found)")
+                continue
+            elif len(results) > 1:
+                raise Exception("The file: " + filepath + " exists more than once in the database.")
+            file_node_id = results[0]
+            self._print_indented("resolved ({})".format(file_node_id))
+
+            # Create a node for the affected file and connect the patch-node with it.
+            patch_file_node_id = self._query("g.addVertex().id")[0]
+            # Connect the patch with this newly created node.
+            self._query("g.addEdge(g.v('{}'), g.v('{}'), 'affects')".format(patch_node_id, patch_file_node_id))
+            # Connect the this node to the corresponding affected file node.
+            self._query("g.addEdge(g.v('{}'), g.v('{}'), 'isFile')".format(patch_file_node_id, file_node_id))
+
+            # TODO: for now we apply patches for reverse patches only... (see TODO below, too)
+            new_file_node_id = "-1"
+            if is_reversed_patch:
+                new_file_node_id = self._apply_patch(self.patch_filepath, patch_file_node_id, patch)
+            else:
+                self._print_indented("[~] Skipping patching for non-reversed patch.", 2)
+
+            # Process all hunks contained in the current patch.
+            patch_operations = self._process_patch_hunks(patch, fuzzed_line_offsets, patch_i, is_reversed_patch)
+
+            self._print_indented("[!] Effects:", 2)
+            self._print_indented(str(patch_operations), 3)
+
+            # Connect the node with all code parts that it affects in the database.
+            amount_connected_nodes = self._connect_patch(patch_file_node_id, file_node_id, patch_operations,
+                                                         is_reversed_patch, new_file_node_id)
+
+            amount_patchfile_connected_nodes += amount_connected_nodes
+            if amount_connected_nodes > 0:
+                self._print_indented("[+] Connected patch node with {} AST node/s.".format(
+                    amount_connected_nodes), 2)
+            else:
+                self._print_indented("[-] Patch can't be applied to the current code base.", 2)
+                # Remove patch file node again.
+                self._query("g.v('{}').remove()".format(patch_file_node_id))
+
+        if amount_patchfile_connected_nodes > 0:
+            self._print_indented(
+                "[+] Patchnode was connected to {} AST node/s.".format(amount_patchfile_connected_nodes))
         else:
-            print(text)
+            self._print_indented("[-] Patchfile is not applicable to the current database.")
+            # Remove patch node again.
+            self._query("g.v('{}').remove()".format(patch_node_id))
+        self._print_indented("------------------------------------------------------------")
+        self.flush_message_queue()
 
     def _joern_import_file(self, patch_filename, source_filepath):
         source_directory = os.path.dirname(source_filepath)
-        patched_file_directory = PATCH_EXTRAPOLATION_DIRECTORY + "/" + patch_filename + "/" + source_directory
+
+        extrapolation_directory = self.temporary_directory + "/" + PATCH_EXTRAPOLATION_DIRECTORY
+        parsed_directory = self.temporary_directory + "/" + PATCH_PARSED_DIRECTORY
+
+        patched_file_directory = patch_filename + "/" + source_directory
         database_patchfile_filepath = patched_file_directory + "/" + os.path.basename(source_filepath)
 
         # Flush any files from previous runs.
-        shutil.rmtree(PATCH_EXTRAPOLATION_DIRECTORY, True)
-        shutil.rmtree(PATCH_PARSED_DIRECTORY, True)
+        shutil.rmtree(extrapolation_directory, True)
+        shutil.rmtree(parsed_directory, True)
 
         # Create a patch extrapolation directory.
-        os.makedirs(patched_file_directory)
-        # Move our patched file into this directory.
-        shutil.move(source_filepath, patched_file_directory)
+        os.makedirs(extrapolation_directory + "/" + patched_file_directory)
 
+        # Move our patched file into this directory.
+        shutil.move(self.temporary_directory + "/" + source_filepath,
+                    extrapolation_directory + "/" + patched_file_directory)
 
         # Invoke joern-parse to create a CSV structure in the parsed directory.
         self._print_indented("[~] Parsing patched-file: " + database_patchfile_filepath, 2)
-        call_arguments = [JOERN_PARSE_PATH, patched_file_directory]
-        subprocess.call(call_arguments, stdout=open(os.devnull, 'wb'))
-
+        call_arguments = [JOERN_PARSE_PATH, PATCH_EXTRAPOLATION_DIRECTORY + "/" + patched_file_directory]
+        subprocess.call(call_arguments, stdout=open(os.devnull, 'wb'), cwd=self.temporary_directory)
 
         #print(os.path.abspath(PATCH_PARSED_DIRECTORY))
         #time.sleep(60)
-
 
         # TODO: very dirty way of inserting the CSV directory here. We need better support in OctopusImporter.py...
         import_settings = """{
@@ -117,13 +264,13 @@ class PATCHES():
         "projectName": "%s",
         "importCSVDirectory": "%s"
         }}
-        """ % ("%s", os.path.abspath(PATCH_PARSED_DIRECTORY))
+        """ % ("%s", parsed_directory)
 
         self._print_indented("[~] Importing file into the database.", 2)
-        importer = JoernImporter(self.projectName, import_settings)
+        importer = JoernImporter(self.project_name, import_settings)
         importer.executeImporterPlugin()
 
-    def _get_fuzzed_line_offsets(self, patch_filepath, source_location, apply_reversed=False):
+    def _get_fuzzed_line_offsets(self, patch_filepath, apply_reversed=False):
         """Call the Linux "patch" utility on a patchfile to get correct (fuzzed) line starts for all included patches.
 
         The current files the patch is supposed to be applied on might have changed over time.
@@ -132,7 +279,6 @@ class PATCHES():
 
         Args:
           patch_filepath: str The patchfile we want to test against our currently existing code base.
-          source_location: str The path to a temporary location containing copies of all affected files.
           apply_reversed: bool True if the patch is supposed to be applied in reverse.
 
         Returns:
@@ -146,7 +292,7 @@ class PATCHES():
         patch_utility_parameters = ["--verbose", "--ignore-whitespace",
                                     "--strip", "1",
                                     "-r", os.devnull,
-                                    "-d", source_location,
+                                    "-d", self.temporary_directory,
                                     "-i", patch_filepath]
         if apply_reversed:
             patch_utility_parameters += ["-R", "-f"]
@@ -321,13 +467,12 @@ class PATCHES():
             hunk_i += 1
         return patch_operations
 
-    def _copy_affected_files(self, temp_dir, patches):
+    def _copy_affected_files(self, patches):
         """Copy all by a patch file affected files into a temporary location.
 
          This method merges the fuzzed line start results with all parsed information contained in this patch hunks.
 
          Args:
-           temp_dir: String The path of the temporary location.
            patches: [Patch] A list of all patches contained in a patch file.
          """
         # Copy all affected files into a temporary location.
@@ -337,9 +482,9 @@ class PATCHES():
             if not os.path.isfile(original_filepath):
                 continue
             # Create the according subdirectories in our temporary location.
-            os.makedirs(temp_dir + "/" + os.path.dirname(patch.path), exist_ok=True)
+            os.makedirs(self.temporary_directory + "/" + os.path.dirname(patch.path), exist_ok=True)
             # Copy the original file into our temporary location.
-            temporary_filecopy_path = temp_dir + "/" + patch.path
+            temporary_filecopy_path = self.temporary_directory + "/" + patch.path
             shutil.copyfile(original_filepath, temporary_filecopy_path)
 
 
@@ -385,7 +530,6 @@ class PATCHES():
        Args:
          patch_filepath: str The patch's filepath.
        """
-        #
         amount_connected_nodes = 0
         for operation in patch_operations:
             affected_segments = patch_operations[operation]
@@ -414,169 +558,118 @@ class PATCHES():
         return amount_connected_nodes
 
 
-    def _import_patch_file(self, patch_filepath):
-        """Import one single patch into the database.
 
-        Importing means:
-        1) Creating a new node for the patch (if it doesn't exist yet).
-        2) Dry applying this patch on the current code base (to get updated line offsets).
-        3) Parsing the patchfile and determining all effects.
-        4) Retrieving all nodes of affected source code from the database.
-        5) Showing some basic statistics about how well the patch could be integrated.
+class PatchImporter():
+    def __init__(self, databaseName = 'octopusDB'):
+        self.argParser = ArgumentParser(description = DESCRIPTION)
+        self.argParser.add_argument('project')
+        # TODO: For now we are ignoring the databaseName in the init parameter. This should be adjusted.
+        self.argParser.add_argument(
+                "directory",
+                help = """The directory containing *.patch files.""")
+
+        self.args = self.argParser.parse_args()
+        self.project_name = self.args.project
+
+        self.j = PythonShellInterface()
+        self.j.setDatabaseName(self.project_name)
+        self.j.connectToDatabase()
+        # TODO: replace this ugly code once a nicer way to load steps is available.
+        old_stdout = sys.stdout
+        sys.stdout = open(os.devnull, "w")
+        reload_dir(self.j.shell_connection, "steps")
+        sys.stdout.close()
+        sys.stdout = old_stdout
+        # ------------------------------------------------------------------------
+
+        # Get the current code base location.
+        # TODO: Is there no cleaner way to get the root element of a graph?
+        #self.code_base_location = self._query("queryNodeIndex('key:1').filepath")[0]
+        self.code_base_location = self._query("execSQLQuery('SELECT FROM #9:1').filepath")[0]
+
+        if not self.code_base_location:
+            raise Exception("[!] Couldn't retrieve the code base location.")
+
+        self._print_indented("[~] Using code base location: " + self.code_base_location)
+        # An array storing all running importer threads.
+        self.import_threads = []
+
+    def _query(self, query):
+        """Emit a Gremlin query."""
+        return self.j.runGremlinQuery(query)
+
+    def _print_indented(self, text, level=0, no_newline=0):
+        """self._print_indented(the given text indented with 'level' many tabs.)
 
         Args:
-          patch_filepath: str The patch's filepath.
+          text: str The text to be printed.
+          level: int The number of tabs to write before the text.
+          no_newline: int Avoid a newline at the end.
         """
-        sys.stdout.write("[~] Importing: " + patch_filepath + " - ")
+        for i in range (0, level):
+            sys.stdout.write("\t")
+        if no_newline:
+            sys.stdout.write(text)
+        else:
+            print(text)
 
-        # Create a node for this patch if it doesn't already exist.
-        patch_description = 'Description tba.'
-        patch_node_id = self._query("createPatchNode('{}', '{}')".format(patch_filepath, patch_description))[0]
+    def start_new_import_thread(self, patch_path):
+        """Starts a new importer thread once there is a free slot.
 
-        if not patch_node_id:
-            raise Exception("[!] Can't create a new node.")
-        if patch_node_id == "-1":
-            raise Exception("[!] A node for this patch existed more than once. Removed all instances. Please retry.")
-        self._print_indented("created/resolved (" + str(patch_node_id) + ")")
+        Waits until less than MAX_NUMBER_THREADS threads are running and starts a new importer thread.
 
-        # Remove any previous operation and file nodes of this patch-node.
-        self._query("cleanupPatchEffects('" + str(patch_node_id) + "')")
-
-        # Parse the patch and read general information.
-        patches = PatchSet.from_filename(patch_filepath, encoding='utf-8')
-        number_of_patches = len(patches)
-        self._print_indented("[~] Patchfile consists of {} patch/es.".format(number_of_patches))
-
-        is_reversed_patch = False
-
-        # Iterate over all affected files and copy them into a temporary location.
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # As of now we will work in the temporary directory only.
-            os.chdir(temp_dir)
-
-            # Copy all affected files into the temporary directory.
-            self._copy_affected_files(temp_dir, patches)
-
-            # Apply this patch to the temporary location.
-            # Fetch adjusted/fuzzed lines in case the patch doesn't match perfectly.
-            fuzzed_line_offsets = self._get_fuzzed_line_offsets(patch_filepath, temp_dir)
-            if fuzzed_line_offsets == -1:
-                # This seems to be a patch that should be applied in reverse.
-
-                # TODO: find a nicer solution than to copy all files again here to avoid side effects...
-                self._copy_affected_files(temp_dir, patches)
-
-                is_reversed_patch = True
-                fuzzed_line_offsets = self._get_fuzzed_line_offsets(patch_filepath, temp_dir, True)
-                self._print_indented("[!] This patch was already applied to the project. Treating as reversed patch.")
-
-            #print(temp_dir)
-            #time.sleep(30)
-
-            # Store some meta information about this patch.
-            self._query("g.v('{}').reversed = \"{}\"".format(patch_node_id, is_reversed_patch))
-            self._query("g.v('{}').numAffectedFiles = {}".format(patch_node_id, number_of_patches))
-
-            amount_patchfile_connected_nodes = 0
-            patch_i = -1
-            # Each patch refers to effects on one single file.
-            for patch in patches:
-                patch_i += 1
-
-                filepath = self.code_base_location + "/" + patch.path
-                number_of_hunks = len(patch)
-                self._print_indented("[->] " + filepath + " (" + str(number_of_hunks) + " hunk/s) - ", 1, 1)
-
-                # TODO: I have no idea why we need to do this. OrientDB is giving us a hard time with indices :(.
-                filepath = filepath[-100:]
-                results = self._query("queryFileByPath('{}', true).toList().id".format(filepath))
-                # TODO: remove this == [''] once the OrientDB Gremlin "List instead element" return mystery is resolved.
-
-                # Check if this file exists in the code base.
-                if len(results) == 0 or results == ['']:
-                    self._print_indented("skipped (not found)")
-                    continue
-                elif len(results) > 1:
-                    raise Exception("The file: " + filepath + " exists more than once in the database.")
-                file_node_id = results[0]
-                self._print_indented("resolved ({})".format(file_node_id))
-
-                # Create a node for the affected file and connect the patch-node with it.
-                patch_file_node_id = self._query("g.addVertex().id")[0]
-                # Connect the patch with this newly created node.
-                self._query("g.addEdge(g.v('{}'), g.v('{}'), 'affects')".format(patch_node_id, patch_file_node_id))
-                # Connect the this node to the corresponding affected file node.
-                self._query("g.addEdge(g.v('{}'), g.v('{}'), 'isFile')".format(patch_file_node_id, file_node_id))
-
-                # TODO: for now we apply patches for reverse patches only... (see TODO below, too)
-                new_file_node_id = "-1"
-                if is_reversed_patch:
-                    new_file_node_id = self._apply_patch(patch_filepath, patch_file_node_id, patch)
-                else:
-                    self._print_indented("[~] Skipping patching for non-reversed patch.", 2)
-
-                # Process all hunks contained in the current patch.
-                patch_operations = self._process_patch_hunks(patch, fuzzed_line_offsets, patch_i, is_reversed_patch)
-
-                self._print_indented("[!] Effects:", 2)
-                self._print_indented(patch_operations, 3)
-
-                # Connect the node with all code parts that it affects in the database.
-                amount_connected_nodes = self._connect_patch(patch_file_node_id, file_node_id, patch_operations,
-                                                             is_reversed_patch, new_file_node_id)
-
-                amount_patchfile_connected_nodes += amount_connected_nodes
-                if amount_connected_nodes > 0:
-                    self._print_indented("[+] Connected patch node with {} AST node/s.".format(
-                                        amount_connected_nodes), 2)
-                else:
-                    self._print_indented("[-] Patch can't be applied to the current code base.", 2)
-                    # Remove patch file node again.
-                    self._query("g.v('{}').remove()".format(patch_file_node_id))
-
-            if amount_patchfile_connected_nodes > 0:
-                self._print_indented(
-                    "[+] Patchnode was connected to {} AST node/s.".format(amount_patchfile_connected_nodes))
-            else:
-                self._print_indented("[-] Patchfile is not applicable to the current database.")
-                # Remove patch node again.
-                self._query("g.v('{}').remove()".format(patch_node_id))
-            self._print_indented("------------------------------------------------------------")
-
-
+        Args:
+        patch_path: String The patch filepath.
         """
-        try:
-            tmp_dir = tempfile.mkdtemp()  # create dir
-            # ... do something
-        finally:
-            try:
-            shutil.rmtree(tmp_dir)  # delete directory
-        except OSError as exc:
-            if exc.errno != errno.ENOENT:  # ENOENT - no such file or directory
-                raise  # re-raise exception
-        """
+        patchFileImporter = PatchFileImporter(self.project_name, self.code_base_location, patch_path)
 
-    def importDirectory(self):
+        scheduled = False
+        while not scheduled:
+            # Remove any threads that have finished by now.
+            #self.import_threads = [thread for thread in self.import_threads if thread.isAlive()]
+            running_threads = [thread for thread in self.import_threads if thread.isAlive()]
+            number_running_threads = len(running_threads)
+            # Start threads only if there are free slots left.
+            if number_running_threads < MAX_NUMBER_THREADS:
+                new_thread = threading.Thread(target=patchFileImporter.import_patch_file)
+                self.import_threads.append(new_thread)
+                new_thread.start()
+                self._print_indented("[~] Started new thread - running {}/{}.".format(
+                    (number_running_threads + 1), MAX_NUMBER_THREADS))
+                scheduled = True
+            # Wait some milliseconds until retry.
+            time.sleep(0.05)
+
+    def import_directory(self):
         """Import all patches contained in a given directory.
 
-        See _import_patch_file for more information regarding importing.
+        See the PatchFileImporter class for more information regarding importing.
         """
         # We need to resolve the absolute path to avoid multiple entries for the same patch in the database.
         import_path = os.path.abspath(self.args.directory)
 
         if os.path.isfile(import_path):
             # Include a single patch file.
-            self._import_patch_file(import_path)
+            patchFileImporter = PatchFileImporter(self.project_name, self.code_base_location, import_path)
+            patchFileImporter.disable_message_buffering()
+            patchFileImporter.import_patch_file()
         else:
             self._print_indented("[~] Importing directory: " + import_path)
             self._print_indented("------------------------------------------------------------")
-            # Scan directory for patch files to import.
+            # Scan directory for patch files to import and start threaded importing.
             for file in os.listdir(import_path):
-                if file.endswith(".patch"):
-                    self._import_patch_file(import_path + '/' + file)
+                if not file.endswith(".patch"):
+                    continue
+                patch_path = import_path + '/' + file
+                self._print_indented("[~] Starting thread for: " + patch_path)
+                self.start_new_import_thread(patch_path)
+                sys.stdout.flush()
+            # Wait until all remaining threads have terminated.
+            for thread in self.import_threads:
+                thread.join()
 
         self._print_indented("[+] Importing finished.")
 
 if __name__ == '__main__':
-    tool = PATCHES()
-    tool.importDirectory()
+    tool = PatchImporter()
+    tool.import_directory()
