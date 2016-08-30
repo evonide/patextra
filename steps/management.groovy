@@ -100,6 +100,7 @@ cleanupPatchEffects = {String patch_node_id ->
     patch_file_nodes._().out('removes').remove();
     // Cleanup all patch file nodes now.
     patch_file_nodes._().remove();
+    g.commit();
 }
 
 /**
@@ -126,7 +127,7 @@ connectPatchWithAffectedCode = { String patch_file_node_id, String file_node_id,
     } else {
         patch_file_node.addEdge(operation, new_operation_node);
     }
-
+    g.commit();
     return affectedLineNodes.size;
 }
 

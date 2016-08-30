@@ -30,7 +30,7 @@ PATCH_EXTRAPOLATION_DIRECTORY = "patch-extrapolation"
 PATCH_PARSED_DIRECTORY = "parsed"
 
 # Multithreading support.
-MAX_NUMBER_THREADS = 10
+MAX_NUMBER_THREADS = 4
 
 DESCRIPTION = """Import all security patches from a specific directory/file and integrate those into the database."""
 
@@ -187,10 +187,12 @@ class PatchFileImporter():
 
             # Create a node for the affected file and connect the patch-node with it.
             patch_file_node_id = self._query("g.addVertex().id")[0]
-            # Connect the patch with this newly created node.
-            self._query("g.addEdge(g.v('{}'), g.v('{}'), 'affects')".format(patch_node_id, patch_file_node_id))
-            # Connect the this node to the corresponding affected file node.
-            self._query("g.addEdge(g.v('{}'), g.v('{}'), 'isFile')".format(patch_file_node_id, file_node_id))
+            # Connect the patch with this newly created patch file node.
+            self._query("g.addEdge(g.v('{}'), g.v('{}'), 'affects'); g.commit();".format(patch_node_id,
+                                                                                         patch_file_node_id))
+            # Connect the patch file node with the corresponding affected file node.
+            self._query("g.addEdge(g.v('{}'), g.v('{}'), 'isFile'); g.commit();".format(patch_file_node_id,
+                                                                                        file_node_id))
 
             # TODO: for now we apply patches for reverse patches only... (see TODO below, too)
             new_file_node_id = "-1"
@@ -216,7 +218,7 @@ class PatchFileImporter():
             else:
                 self._print_indented("[-] Patch can't be applied to the current code base.", 2)
                 # Remove patch file node again.
-                self._query("g.v('{}').remove()".format(patch_file_node_id))
+                self._query("g.v('{}').remove(); g.commit();".format(patch_file_node_id))
 
         if amount_patchfile_connected_nodes > 0:
             self._print_indented(
@@ -224,7 +226,7 @@ class PatchFileImporter():
         else:
             self._print_indented("[-] Patchfile is not applicable to the current database.")
             # Remove patch node again.
-            self._query("g.v('{}').remove()".format(patch_node_id))
+            self._query("g.v('{}').remove(); g.commit();".format(patch_node_id))
         self._print_indented("------------------------------------------------------------")
         self.flush_message_queue()
 

@@ -24,7 +24,7 @@ exit()
 DESCRIPTION = """Takes a node-id of any statement and extrapolates it to further code places."""
 
 
-NUMBER_OF_NEIGHBORS_TO_DISPLAY = 10
+NUMBER_OF_NEIGHBORS_TO_DISPLAY = 40
 # Number of hops to follow during slicing.
 SLICING_PDG_PRECISION = 5
 
@@ -105,18 +105,18 @@ class NodeExtrapolator(AccTool):
 
     def _querySlicing(self, query):
         slice_node_ids = self._runGremlinQuery(query)
-        if not slice_node_ids:
+        if not slice_node_ids or 'Exception' in slice_node_ids[0]:
             sys.stderr.write("[-] Couldn't slice from this sink.\n")
             sys.exit()
         return slice_node_ids
 
     def _sliceBackwards(self, node_id, slicing_precision=SLICING_PDG_PRECISION):
         # TODO: fix very dirty workaround with join newline style... Python API FIX required???
-        backward_query = """
+        slice_query = """
         g.v('%s')._().sideEffect
         {
             if(it.nodeType == 'Argument') {
-                symbols = it.uses().code.toList()
+                symbols = it._().uses().code.toList()
             } else {
                 symbols = it._().statements().out('USE', 'DEF').code.toList()
             }
@@ -124,16 +124,16 @@ class NodeExtrapolator(AccTool):
             it._().backwardSlice(symbols, %d).id.toList().join("\\n")
         }
         """ % (node_id, slicing_precision)
-        return self._querySlicing(backward_query)
+        return self._querySlicing(slice_query)
 
     def _sliceForwards(self, node_id, slicing_precision=SLICING_PDG_PRECISION):
-        backward_query = """
+        slice_query = """
         g.v('%s').sideEffect
         {
             if(it.nodeType == 'Callee') {
-                symbols = it.matchParents{it.nodeType == 'AssignmentExpr'}.lval().code.toList()
+                symbols = it._().matchParents{it.nodeType == 'AssignmentExpression'}.lval().code.toList()
             } else if(it.nodeType == 'Argument') {
-                 symbols = it.defines().code.toList()
+                 symbols = it._().defines().code.toList()
             } else {
                  symbols = it._().statements().out('USE', 'DEF').code.toList()
             }
@@ -141,7 +141,7 @@ class NodeExtrapolator(AccTool):
             it._().forwardSlice(symbols, %d).id.toList().join("\\n")
         }
         """ % (node_id, slicing_precision)
-        return self._querySlicing(backward_query)
+        return self._querySlicing(slice_query)
 
     def _sliceBidrectional(self, node_id):
         slicing_precision = SLICING_PDG_PRECISION / 2
@@ -203,13 +203,21 @@ class NodeExtrapolator(AccTool):
         try:
             neighbors = knn.getNeighborsFor(initial_node_id)
             for (n, similarity) in neighbors:
-                print(n + "\t" + str(similarity))
+                function_name = self._runGremlinQuery("g.v('{}')._().functions().name".format(n))[0]
+                #filepath = self._runGremlinQuery("g.v('{}')._().functions().functionToFile().filepath".format(n))[0]
+                #+ "\t" + filepath
+                location = self._runGremlinQuery("g.v('{}')._().statements().location".format(n))[0]
+                location = location.split(":")[0]
+                print(n + "\t" + str(similarity) + "\t" + function_name + "\t" + location)
         except KeyError:
             sys.stderr.write("[-] No data point found for %s.\n" % initial_node_id)
             sys.exit()
 
     def processLine(self, node_id):
         self._print("[~] Starting lookup for node: " + str(node_id))
+
+        #self._findNearestNeighbors(node_id)
+        #exit()
 
         # For now we will assume that this is a simple sink!
         # Retrieve the sink symbol...
