@@ -30,7 +30,7 @@ PATCH_EXTRAPOLATION_DIRECTORY = "patch-extrapolation"
 PATCH_PARSED_DIRECTORY = "parsed"
 
 # Multithreading support.
-MAX_NUMBER_THREADS = 4
+MAX_NUMBER_THREADS = 3
 
 DESCRIPTION = """Import all security patches from a specific directory/file and integrate those into the database."""
 
@@ -57,16 +57,19 @@ class PatchFileImporter():
 
     def _init_db(self):
         self.j.connectToDatabase()
-        # Load additional groovy files
-        # TODO: replace this ugly code once a nicer way to load steps is available.
-        for dirpath, dirnames, filenames in os.walk("steps"):
-            filenames[:] = [f for f in filenames if not f.startswith('.')]
-            for filename in filenames:
-                _, ext = os.path.splitext(filename)
-                if ext == ".groovy":
-                    with open(os.path.join(dirpath, filename), 'r') as f:
-                        self.j.shell_connection.run_command(f.read())
-        # ------------------------------------------------------------------------
+        # TODO: very ugly way of testing if the *.groovy files have already been loaded...
+        try:
+            self._query("createPatchNode")
+        except:
+            # Load additional groovy files
+            # TODO: replace this ugly code once a nicer way to load steps is available.
+            for dirpath, dirnames, filenames in os.walk("steps"):
+                filenames[:] = [f for f in filenames if not f.startswith('.')]
+                for filename in filenames:
+                    _, ext = os.path.splitext(filename)
+                    if ext == ".groovy":
+                        with open(os.path.join(dirpath, filename), 'r') as f:
+                            self.j.shell_connection.run_command(f.read())
 
     def disable_message_buffering(self):
         self.buffer_output = False

@@ -10,7 +10,11 @@ import subprocess
 import sys
 
 from joern.shelltool.AccTool import AccTool
+from octopus.server.python_shell_interface import PythonShellInterface
 from octopus.mlutils.KNN import KNN
+from multiprocessing.dummy import Pool as ThreadPool
+
+
 """
 import pkgutil
 import octopus
@@ -23,6 +27,8 @@ exit()
 """
 DESCRIPTION = """Takes a node-id of any statement and extrapolates it to further code places."""
 
+# Multithreading support (used for slicing).
+MAX_NUMBER_THREADS = 8
 
 NUMBER_OF_NEIGHBORS_TO_DISPLAY = 40
 # Number of hops to follow during slicing.
@@ -64,6 +70,20 @@ class NodeExtrapolator(AccTool):
         self.embeddings_data_directory = os.path.join(self.embeddings_directory, 'data')
         self.embeddings_toc_path = os.path.join(self.embeddings_directory, 'TOC')
 
+        if os.path.exists(self.embeddings_directory):
+            if self.args.force:
+                self._print("[!] Removing existing directory.")
+                shutil.rmtree(self.embeddings_directory)
+            else:
+                sys.stderr.write("[-] Please remove the embeddings directory first or supply --force.\n")
+                sys.exit()
+
+        # TODO: REMOVE ALL FOLLOWING LINES...
+        shell_interface = PythonShellInterface()
+        shell_interface.setDatabaseName(self.args.project)
+        shell_interface.connectToDatabase()
+
+
     def _print(self, message):
         if self.args.verbose:
             print(message)
@@ -89,6 +109,12 @@ class NodeExtrapolator(AccTool):
             sys.exit()
         return sink_node_ids
 
+    def _isolated_query(self, query):
+        shell_interface = PythonShellInterface()
+        shell_interface.setDatabaseName(self.args.project)
+        shell_interface.connectToDatabase()
+        return shell_interface.runGremlinQuery(query)
+
     def _resolveNodeSymbols(self, sink_slice_node_ids):
         node_ids_to_symbols = """idListToNodes(%s).astNodes()
         .filter{
@@ -97,14 +123,14 @@ class NodeExtrapolator(AccTool):
         .code.toList()"""
         node_ids_to_symbols = node_ids_to_symbols % sink_slice_node_ids
 
-        node_symbols = self._runGremlinQuery(node_ids_to_symbols)
+        node_symbols = self._isolated_query(node_ids_to_symbols)
         if not node_symbols:
             sys.stderr.write("[-] Couldn't resolve the supplied nodes' symbols.\n")
             sys.exit()
         return node_symbols
 
     def _querySlicing(self, query):
-        slice_node_ids = self._runGremlinQuery(query)
+        slice_node_ids = self._isolated_query(query)
         if not slice_node_ids or 'Exception' in slice_node_ids[0]:
             sys.stderr.write("[-] Couldn't slice from this sink.\n")
             sys.exit()
@@ -128,7 +154,36 @@ class NodeExtrapolator(AccTool):
 
     def _sliceForwards(self, node_id, slicing_precision=SLICING_PDG_PRECISION):
         slice_query = """
-        g.v('%s').sideEffect
+
+        slice_parameters = {def parameter_node_ids, def original_statement_key ->
+            results = []
+
+            for (String parameter_node_id: parameter_node_ids) {
+                parameter_node = g.v(parameter_node_id);
+
+                defined_declarations = parameter_node.in('DEF').filter{
+                    it.nodeType == 'IdentifierDeclStatement'
+                }.toList();
+                if (defined_declarations.size > 0) {
+                    affected_statements = defined_declarations._().out('REACHES').filter{
+                        it.key > original_statement_key
+                    }
+                }
+                else {
+                    // Parameters like &VAR don't have proper define statements...
+                    // We will fallback to all incoming "USE" edges for now...
+                    affected_statements = parameter_node.in('USE').filter{
+                        it.nodeType != 'Argument' && it.key > original_statement_key
+                    }
+                }
+                results += affected_statements.toList();
+            }
+            return results._().dedup().sort{it.key}.toList();
+        }
+        statement_node = g.v('%s');
+        statement_key = statement_node.key;
+
+        statement_node.sideEffect
         {
             if(it.nodeType == 'Callee') {
                 symbols = it._().matchParents{it.nodeType == 'AssignmentExpression'}.lval().code.toList()
@@ -138,7 +193,18 @@ class NodeExtrapolator(AccTool):
                  symbols = it._().statements().out('USE', 'DEF').code.toList()
             }
         }._().statements().transform{
-            it._().forwardSlice(symbols, %d).id.toList().join("\\n")
+            sliced_nodes = it._().forwardSlice([symbols, %d]).toList();
+
+            if (sliced_nodes.size == 1) {
+                // The slicing didn't work. We can try our alternative parameter slicing instead.
+                // If there is no assigment happening e.g. in "RET_VAL = CALL(PARAMS);" we will just extract "PARAMS".
+                parameter_ids = statement_node._().statements().out('USE', 'DEF').id.toList()
+
+                sliced_nodes = [statement_node]
+                sliced_nodes += slice_parameters(parameter_ids, statement_key);
+                //System.out.println(sliced_nodes);
+            }
+            return sliced_nodes.id.join("\\n");
         }
         """ % (node_id, slicing_precision)
         return self._querySlicing(slice_query)
@@ -151,14 +217,17 @@ class NodeExtrapolator(AccTool):
         bidirectional_slice_node_ids = backwards_slice_node_ids + forwards_slice_node_ids
         return bidirectional_slice_node_ids
 
+    def slice_and_resolve_code(self, sink_node_id):
+        #self._print("Slicing node: " + str(sink_node_id))
+        #sink_slice_node_ids = self._sliceBackwards(sink_node_id)
+        sink_slice_node_ids = self._sliceForwards(sink_node_id)
+
+        #sink_slice_node_ids = self._sliceBidrectional(sink_node_id)
+
+        code = self._resolveNodeSymbols(sink_slice_node_ids)
+        return code
+
     def _symbolsToStringEmbeddings(self, symbols):
-        if os.path.exists(self.embeddings_directory):
-            if self.args.force:
-                self._print("[!] Removing existing directory.")
-                shutil.rmtree(self.embeddings_directory)
-            else:
-                sys.stderr.write("[-] Please remove the embeddings directory first or supply --force.\n")
-                sys.exit()
         os.makedirs(self.embeddings_data_directory)
 
         table_of_contents = {}
@@ -227,6 +296,10 @@ class NodeExtrapolator(AccTool):
             sys.exit()
         self._print("[+] Retrieved sink symbol: " + sink_symbol)
 
+        #code_symbols = self.slice_and_resolve_code(node_id)
+        #print(code_symbols)
+        #exit()
+
         # 1) Retrieve all interesting sink nodes
         sink_node_ids = self._getSimilarSinkNodeIDs(sink_symbol)
         #print sink_node_ids
@@ -236,16 +309,14 @@ class NodeExtrapolator(AccTool):
         # Add the initial node to the set of all sink nodes, too.
         sink_node_ids.insert(0, node_id)
 
-        resolved_symbols = {}
-        for sink_node_id in sink_node_ids:
-            #self._print("Slicing node: " + str(sink_node_id))
-            #sink_slice_node_ids = self._sliceBackwards(sink_node_id)
-            sink_slice_node_ids = self._sliceForwards(sink_node_id)
-            #sink_slice_node_ids = self._sliceBidrectional(sink_node_id)
+        # Start up to MAX_NUMBER_THREADS to resolve all slices and their code from the corresponding sink node ids.
+        pool = ThreadPool(MAX_NUMBER_THREADS)
+        resolved_code = pool.map(self.slice_and_resolve_code, sink_node_ids)
+        pool.close()
+        pool.join()
 
-            code = self._resolveNodeSymbols(sink_slice_node_ids)
-            resolved_symbols[sink_node_id] = code
-
+        # Join the results with their corresponding sink node ids.
+        resolved_symbols = {str(sink_node_id): resolved_code[i] for (i, sink_node_id) in enumerate(sink_node_ids)}
 
         # Store all resolved symbols
         self._symbolsToStringEmbeddings(resolved_symbols)
