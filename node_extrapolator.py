@@ -28,7 +28,7 @@ exit()
 DESCRIPTION = """Takes a node-id of any statement and extrapolates it to further code places."""
 
 # Multithreading support (used for slicing).
-MAX_NUMBER_THREADS = 8
+MAX_NUMBER_THREADS = 4
 
 NUMBER_OF_NEIGHBORS_TO_DISPLAY = 40
 # Number of hops to follow during slicing.
@@ -90,7 +90,9 @@ class NodeExtrapolator(AccTool):
             sys.stdout.flush()
 
     def _getSinkSymbol(self, node_id):
-        symbol_query = "g.v('%s')._().statements().children().out.dedup().loop(2){true}{true}.filter{it.nodeType == 'Callee'}.code"
+        symbol_query = """g.v('%s')._().statements().children().out.dedup().loop(2){true}{true}.filter{
+                            it.nodeType == 'Callee'
+                       }.code"""
         symbol_query = symbol_query % node_id
 
         sink_symbol = self._runGremlinQuery(symbol_query)
@@ -102,9 +104,9 @@ class NodeExtrapolator(AccTool):
     def _getSimilarSinkNodeIDs(self, sink_symbol):
         more_sinks_query = "getCallsTo('%s').transform{it.id}"
         more_sinks_query = more_sinks_query % sink_symbol
-
         sink_node_ids = self._runGremlinQuery(more_sinks_query)
-        if not sink_node_ids:
+
+        if not sink_node_ids or sink_node_ids == ['']:
             sys.stderr.write("[-] Strange error occured. At least the initial sink must exist...\n")
             sys.exit()
         return sink_node_ids
@@ -118,7 +120,10 @@ class NodeExtrapolator(AccTool):
     def _resolveNodeSymbols(self, sink_slice_node_ids):
         node_ids_to_symbols = """idListToNodes(%s).astNodes()
         .filter{
-            it.nodeType == 'IdentifierDeclType' || it.nodeType == 'ParameterType' || it.nodeType == 'Callee' || it.nodeType == 'Sizeof'
+            it.nodeType == 'IdentifierDeclType' ||
+            it.nodeType == 'ParameterType' ||
+            it.nodeType == 'Callee' ||
+            it.nodeType == 'Sizeof'
         }
         .code.toList()"""
         node_ids_to_symbols = node_ids_to_symbols % sink_slice_node_ids
@@ -183,6 +188,7 @@ class NodeExtrapolator(AccTool):
         statement_node = g.v('%s');
         statement_key = statement_node.key;
 
+        sliced_nodes = []
         statement_node.sideEffect
         {
             if(it.nodeType == 'Callee') {
@@ -193,9 +199,11 @@ class NodeExtrapolator(AccTool):
                  symbols = it._().statements().out('USE', 'DEF').code.toList()
             }
         }._().statements().transform{
-            sliced_nodes = it._().forwardSlice([symbols, %d]).toList();
-
-            if (sliced_nodes.size == 1) {
+            if(symbols.size > 0) {
+                // Slice only if symbols were successfully identifed...
+                sliced_nodes = it._().forwardSlice([symbols, %d]).toList();
+            }
+            if (sliced_nodes.size <= 1) {
                 // The slicing didn't work. We can try our alternative parameter slicing instead.
                 // If there is no assigment happening e.g. in "RET_VAL = CALL(PARAMS);" we will just extract "PARAMS".
                 parameter_ids = statement_node._().statements().out('USE', 'DEF').id.toList()
@@ -221,7 +229,8 @@ class NodeExtrapolator(AccTool):
         #self._print("Slicing node: " + str(sink_node_id))
         #sink_slice_node_ids = self._sliceBackwards(sink_node_id)
         sink_slice_node_ids = self._sliceForwards(sink_node_id)
-
+        #print(sink_slice_node_ids)
+        #exit()
         #sink_slice_node_ids = self._sliceBidrectional(sink_node_id)
 
         code = self._resolveNodeSymbols(sink_slice_node_ids)
