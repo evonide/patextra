@@ -63,6 +63,22 @@ queryFileByPath = { def filepath, def workaround ->
     return execSQLQuery(sqlQuery);
 }
 
+//patch_nodes = queryPatchIndex("/.*patch/")
+//patch_nodes._().transform{it.id + "\t" + it.out.out('applies').sideEffect{it.linesAdded-it.linesRemoved}}
+
+/**
+ Retrieve all patches in a sorted order.
+ */
+get_all_patches = {
+    queryPatchIndex("/.*patch/").sort{
+        it.linesAdded - it.linesRemoved
+    }._().sideEffect{
+        delta = it.linesAdded - it.linesRemoved
+    }.transform {
+        "" + it.id + "\t" + it.filepath + "\t" + delta + "\t" + it.reversed
+    }
+}
+
 /**
  * Get all nodes from a specific start line to a specific end line starting at a file node.
  *  @param file_node id of the file node
@@ -95,9 +111,7 @@ cleanupPatchEffects = {String patch_node_id ->
     // Get all patch file nodes.
     patch_file_nodes = patch_node.out('affects').toList();
     // Remove any patch operations.
-    patch_file_nodes._().out('adds').remove();
-    patch_file_nodes._().out('replaces').remove();
-    patch_file_nodes._().out('removes').remove();
+    patch_file_nodes._().out('applies').remove();
     // Cleanup all patch file nodes now.
     patch_file_nodes._().remove();
     g.commit();
@@ -111,22 +125,14 @@ cleanupPatchEffects = {String patch_node_id ->
  *  @param start_line line number where code segment starts
  *  @param end_line line number where code segment ends
  * */
-connectPatchWithAffectedCode = { String patch_file_node_id, String file_node_id, String operation, Integer line_start, Integer line_end ->
+connectPatchWithAffectedCode = { String patch_file_node_id, String file_node_id, String hunk_node_id, String operation, Integer line_start, Integer line_end ->
     patch_file_node = g.v(patch_file_node_id);
-
-    // Create a node for representing this operation.
-    new_operation_node = g.addVertex();
+    hunk_node = g.v(hunk_node_id);
 
     // Get all affected nodes and connect the patch file node with them.
     affectedLineNodes = getCodeNodes(file_node_id, line_start, line_end).toList();
-    affectedLineNodes.each{new_operation_node.addEdge(operation, it)}
+    affectedLineNodes.each{hunk_node.addEdge(operation, it)}
 
-    // Remove the operation node if there are no actual effects. Otherwise, connect it to the patch node.
-    if (affectedLineNodes.size == 0) {
-        new_operation_node.remove();
-    } else {
-        patch_file_node.addEdge(operation, new_operation_node);
-    }
     g.commit();
     return affectedLineNodes.size;
 }

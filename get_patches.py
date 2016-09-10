@@ -31,9 +31,17 @@ if __name__ == '__main__':
     sys.stdout.close()
     sys.stdout = old_stdout
 
+
+    show_fields = ['id', 'filepath', 'patch_delta', 'is_reversed']
+
     # Get the current code base location.
-    patch_nodes_results = dbConnection.runGremlinQuery('queryPatchIndex("/.*patch/").transform{"" + it.id + "\t" + it.filepath + "\t" + it.reversed}')
+    patch_nodes_results = dbConnection.runGremlinQuery('get_all_patches()')
+    for field in show_fields:
+        sys.stdout.write(field + "\t")
+    print("")
     for patch_node_result in patch_nodes_results:
-        (patch_node_id, patch_filepath, patch_reversed) = patch_node_result.split("\t")
-        print(str(patch_node_id) + "\t" + patch_reversed + "\t" + patch_filepath)
+        patch_infos = patch_node_result.split("\t")
+        for info in patch_infos:
+            sys.stdout.write(info + "\t")
+        print("")
 

@@ -34,6 +34,8 @@ MAX_NUMBER_THREADS = 3
 
 DESCRIPTION = """Import all security patches from a specific directory/file and integrate those into the database."""
 
+# TODO: remove this one a better way to load steps exists.
+FORCE_STEPS_LOAD = False
 
 class JoernImporter(OctopusImporter):
     def __init__(self, projectName, importSettings):
@@ -55,21 +57,27 @@ class PatchFileImporter():
         self.temporary_directory_object = tempfile.TemporaryDirectory()
         self.temporary_directory = self.temporary_directory_object.name
 
+    def _init_steps(self):
+        for dirpath, dirnames, filenames in os.walk("steps"):
+            filenames[:] = [f for f in filenames if not f.startswith('.')]
+            for filename in filenames:
+                _, ext = os.path.splitext(filename)
+                if ext == ".groovy":
+                    with open(os.path.join(dirpath, filename), 'r') as f:
+                        self.j.shell_connection.run_command(f.read())
+
     def _init_db(self):
         self.j.connectToDatabase()
+        # TODO: replace this ugly code once a nicer way to load steps is available.
+        if FORCE_STEPS_LOAD:
+            self._init_steps()
+            return
         # TODO: very ugly way of testing if the *.groovy files have already been loaded...
         try:
             self._query("createPatchNode")
         except:
             # Load additional groovy files
-            # TODO: replace this ugly code once a nicer way to load steps is available.
-            for dirpath, dirnames, filenames in os.walk("steps"):
-                filenames[:] = [f for f in filenames if not f.startswith('.')]
-                for filename in filenames:
-                    _, ext = os.path.splitext(filename)
-                    if ext == ".groovy":
-                        with open(os.path.join(dirpath, filename), 'r') as f:
-                            self.j.shell_connection.run_command(f.read())
+            self._init_steps()
 
     def disable_message_buffering(self):
         self.buffer_output = False
@@ -100,6 +108,7 @@ class PatchFileImporter():
 
     def _query(self, query):
         """Emit a Gremlin query."""
+        #print(query)
         return self.j.runGremlinQuery(query)
 
     def import_patch_file(self):
@@ -164,6 +173,16 @@ class PatchFileImporter():
         self._query("g.v('{}').reversed = \"{}\"".format(patch_node_id, is_reversed_patch))
         self._query("g.v('{}').numAffectedFiles = {}".format(patch_node_id, number_of_patches))
 
+        # TODO: merge this loop and the one below...
+        patch_linesAdded = 0
+        patch_linesRemoved = 0
+        for patch in patches:
+            patch_linesAdded += patch.added
+            patch_linesRemoved += patch.removed
+        # TODO: remove static string "linesAdded" here...
+        self._query("g.v('{}').linesAdded = {}".format(patch_node_id, patch_linesAdded))
+        self._query("g.v('{}').linesRemoved = {}".format(patch_node_id, patch_linesRemoved))
+
         amount_patchfile_connected_nodes = 0
         patch_i = -1
         # Each patch refers to effects on one single file.
@@ -205,13 +224,13 @@ class PatchFileImporter():
                 self._print_indented("[~] Skipping patching for non-reversed patch.", 2)
 
             # Process all hunks contained in the current patch.
-            patch_operations = self._process_patch_hunks(patch, fuzzed_line_offsets, patch_i, is_reversed_patch)
+            patch_hunks = self._process_patch_hunks(patch, fuzzed_line_offsets, patch_i, is_reversed_patch)
 
             self._print_indented("[!] Effects:", 2)
-            self._print_indented(str(patch_operations), 3)
+            self._print_indented(str(patch_hunks), 3)
 
             # Connect the node with all code parts that it affects in the database.
-            amount_connected_nodes = self._connect_patch(patch_file_node_id, file_node_id, patch_operations,
+            amount_connected_nodes = self._connect_patch(patch_file_node_id, file_node_id, patch_hunks,
                                                          is_reversed_patch, new_file_node_id)
 
             amount_patchfile_connected_nodes += amount_connected_nodes
@@ -229,7 +248,8 @@ class PatchFileImporter():
         else:
             self._print_indented("[-] Patchfile is not applicable to the current database.")
             # Remove patch node again.
-            self._query("g.v('{}').remove(); g.commit();".format(patch_node_id))
+            # TODO: later we should remove this node again...
+            #self._query("g.v('{}').remove(); g.commit();".format(patch_node_id))
         self._print_indented("------------------------------------------------------------")
         self.flush_message_queue()
 
@@ -420,15 +440,14 @@ class PatchFileImporter():
           patch_i: int Index of the currently processed patch (needed for merging purposes).
 
         Returns:
-            A dictionary with entries for added, removed and replaced lines. Each entry contains a list with
-            further lists containing information regarding all accumulated hunk starts and the number of affected lines.
+            A list of dictionaries containing information about by a hunk added, removed and replaced lines.
         """
         hunk_i = 0
-        patch_operations = {"adds": [], "removes": [], "replaces": []}
+        patch_hunks = []
 
         # Return immediately in case this patch has no effect on the current code base.
         if len(fuzzed_line_offsets[patch_i]) == 0:
-            return patch_operations
+            return patch_hunks
 
         global_line_delta = 0
         for hunk in patch:
@@ -449,10 +468,13 @@ class PatchFileImporter():
                     fuzzed_hunk_start_line -= global_line_delta
 
                     hunk_operations = self._parse_patch_hunk(hunk, fuzzed_hunk_start_line)
-                    # Append all operations from this hunk to the curent patch operations.
-                    patch_operations["adds"] += hunk_operations["adds"]
-                    patch_operations["removes"] += hunk_operations["removes"]
-                    patch_operations["replaces"] += hunk_operations["replaces"]
+                    # TODO: refactor static string here...
+                    hunk_operations['metainfo'] = {}
+                    hunk_operations['metainfo']['linesAdded'] = hunk.added
+                    hunk_operations['metainfo']['linesRemoved'] = hunk.removed
+
+                    # Append all hunk operations to the list of all patch hunks.
+                    patch_hunks.append(hunk_operations)
 
                     # Retrieve the delta of this chunk and add it to the global delta so far.
                     hunk_delta = hunk.added-hunk.removed
@@ -470,7 +492,7 @@ class PatchFileImporter():
             else:
                 raise Exception("[!] Mismatch of linux patch utility and unidiff Python library results detected.")
             hunk_i += 1
-        return patch_operations
+        return patch_hunks
 
     def _copy_affected_files(self, patches):
         """Copy all by a patch file affected files into a temporary location.
@@ -529,37 +551,56 @@ class PatchFileImporter():
             patch_file_node_id, new_file_node_id))
         return new_file_node_id
 
-    def _connect_patch(self, patch_file_node_id, file_node_id, patch_operations, is_reversed_patch, new_file_node_id):
-        """Connect all affected source code nodes with a patch file node.
+    def _connect_patch(self, patch_file_node_id, file_node_id, patch_hunks, is_reversed_patch, new_file_node_id):
+        """Connect all affected source code nodes with corresponding hunk nodes.
 
        Args:
          patch_filepath: str The patch's filepath.
        """
         amount_connected_nodes = 0
-        for operation in patch_operations:
-            affected_segments = patch_operations[operation]
+        for hunk_operations in patch_hunks:
+            # Create a node for the affected file and connect the patch-node with it.
+            new_hunk_node_id = self._query("g.addVertex().id")[0]
+            amount_hunk_connected_nodes = 0
 
-            # Connect patch node to original file
-            use_file_node_id = file_node_id
-            if is_reversed_patch:
-                if operation != 'removes':
-                    use_file_node_id = new_file_node_id
+            for operation in hunk_operations:
+                # TODO: remove static string here.
+                # TODO: store metainfos at another place than here.
+                if operation == 'metainfo':
+                    metainfos = hunk_operations[operation]
+                    # Store some infos about this patch and continue...
+                    for metainfo in metainfos:
+                        self._query("g.v('{}').{} = {}".format(new_hunk_node_id, metainfo, metainfos[metainfo]))
+                    continue
+                affected_segments = hunk_operations[operation]
+                # Connect patch node to original file
+                use_file_node_id = file_node_id
+                if is_reversed_patch:
+                    if operation != 'removes':
+                        use_file_node_id = new_file_node_id
 
-            # TODO: add the following if we utilize patched files also for non-reverse patches!
-            #else:
-            #    if operation == 'removes':
-            #        use_file_node_id = new_file_node_id
-            for affected_segment in affected_segments:
-                source_start = affected_segment[0]
-                source_end = source_start + affected_segment[1] - 1
-                # TODO: We could include the number of lines added for a replace here, too.
+                # TODO: add the following if we utilize patched files also for non-reverse patches!
+                #else:
+                #    if operation == 'removes':
+                #        use_file_node_id = new_file_node_id
 
-                # Retrieve all nodes belonging to a specific source code range and connect them with the patch node.
-                query_connect_patch = "connectPatchWithAffectedCode('{}', '{}', '{}', {}, {})".format(
-                    patch_file_node_id, use_file_node_id, operation, source_start, source_end)
-                affected_nodes = self._query(query_connect_patch)
+                for affected_segment in affected_segments:
+                    source_start = affected_segment[0]
+                    source_end = source_start + affected_segment[1] - 1
+                    # TODO: We could include the number of lines added for a replace here, too.
 
-                amount_connected_nodes += int(affected_nodes[0])
+                    # Retrieve all nodes belonging to a specific source code range and connect them with the patch node.
+                    query_connect_patch = "connectPatchWithAffectedCode('{}', '{}', '{}', '{}', {}, {})".format(
+                        patch_file_node_id, use_file_node_id, new_hunk_node_id, operation, source_start, source_end)
+                    affected_nodes = self._query(query_connect_patch)
+
+                    amount_hunk_connected_nodes += int(affected_nodes[0])
+
+            # Connect the patch file node with the hunk node.
+            self._query("g.v('{}').addEdge('applies', g.v('{}'))".format(patch_file_node_id, new_hunk_node_id))
+            # Add the number of connected hunk effects to the number of all connected nodes
+            amount_connected_nodes += amount_hunk_connected_nodes
+
         return amount_connected_nodes
 
 

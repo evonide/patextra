@@ -8,19 +8,19 @@ from urllib.parse import urlparse
 import re
 
 # Pidgin settings
-"""
 ADVISORY_URL = 'https://pidgin.im/news/security/'
 START_PAGES = [ADVISORY_URL + "?offset={}".format(i*50) for i in range(3)]
-SINGLE_ADVISORY_REGEX = r'.*id=\d'
+SINGLE_ADVISORY_REGEX = r'.*id=(\d*)'
 COMMIT_REGEX = r'.*bitbucket.*/commits/(.*)'
-"""
+
 
 # Mozilla settings
+"""
 ADVISORY_URL = "https://www.mozilla.org/en-US/security/advisories/"
 START_PAGES = [ADVISORY_URL]
 SINGLE_ADVISORY_REGEX = r'.*mfsa\d*\-\d*.*'
 COMMIT_REGEX = r'.*bugzilla.*\?id=(\d*)'
-
+"""
 
 class AdvisorySpider(Spider):
     name = 'advisorySpider'
@@ -42,11 +42,13 @@ class AdvisorySpider(Spider):
         hxs = Selector(response)
         for url in hxs.xpath('//a/@href').extract():
             absolute_url = urljoin(response.url, url)
-
             commit_regex = re.compile(COMMIT_REGEX)
             matches_commit = re.match(commit_regex, absolute_url)
             if matches_commit:
                 commit_id = matches_commit.group(1)
+                #matched_bug_id = advisory_regex.match(response.url)
+                #bug_id = matched_bug_id.group(1)
+                #print(bug_id + "\t" + )
                 print(commit_id)
 
             if advisory_regex.match(absolute_url):
