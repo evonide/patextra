@@ -71,11 +71,21 @@ queryFileByPath = { def filepath, def workaround ->
  */
 get_all_patches = {
     queryPatchIndex("/.*patch/").sort{
-        it.linesAdded - it.linesRemoved
+        it.avgHunkComplexity
     }._().sideEffect{
-        delta = it.linesAdded - it.linesRemoved
-    }.transform {
-        "" + it.id + "\t" + it.filepath + "\t" + delta + "\t" + it.reversed
+        // Extremely ugly hardpatch. Replace with proper call ASAP...
+        replace_operations = it._().out('affects').out('applies').out('replaces').toList();
+        callees = replace_operations._().transform{
+            it._().statements().children().out.dedup().loop(2){true}{true}.filter{
+                it.nodeType == 'Callee' && it.code.length() > 0
+            }.toList()
+        }.filter{it.size > 0}.transform{
+            it[0].id
+        }.toList();
+        number_of_affected_functions = callees.size();
+    }._().transform {
+        "" + it.id + "\t" + it.filepath + "\t" + it.avgHunkComplexity + "\t" + number_of_affected_functions +
+                      "\t" + it.reversed
     }
 }
 
@@ -111,9 +121,13 @@ cleanupPatchEffects = {String patch_node_id ->
     // Get all patch file nodes.
     patch_file_nodes = patch_node.out('affects').toList();
     // Remove any patch operations.
-    patch_file_nodes._().out('applies').remove();
-    // Cleanup all patch file nodes now.
-    patch_file_nodes._().remove();
+    if(patch_file_nodes.size > 0) {
+        patch_hunk_nodes = patch_file_nodes._().out('applies').toList();
+        if(patch_hunk_nodes.size > 0) {
+            patch_hunk_nodes._().remove();
+        }
+        patch_file_nodes._().remove();
+    }
     g.commit();
 }
 

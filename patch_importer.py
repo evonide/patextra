@@ -13,6 +13,7 @@ from octopus.importer.OctopusImporter import OctopusImporter
 import re
 import subprocess
 import sys
+import operator
 import os.path
 import shutil
 import tempfile
@@ -30,7 +31,7 @@ PATCH_EXTRAPOLATION_DIRECTORY = "patch-extrapolation"
 PATCH_PARSED_DIRECTORY = "parsed"
 
 # Multithreading support.
-MAX_NUMBER_THREADS = 3
+MAX_NUMBER_THREADS = 12
 
 DESCRIPTION = """Import all security patches from a specific directory/file and integrate those into the database."""
 
@@ -109,7 +110,19 @@ class PatchFileImporter():
     def _query(self, query):
         """Emit a Gremlin query."""
         #print(query)
-        return self.j.runGremlinQuery(query)
+        # Try the query multiple times to cope with concurrency issues.
+        max_retries = 6
+        for i in range(0, max_retries):
+            try:
+                return self.j.runGremlinQuery(query)
+            except Exception as e:
+                if "OConcurrentModificationException" in str(e) or "IllegalStateException" in str(e):
+                    #print("[!] -------- Concurrency error. Retrying... --------")
+                    continue
+                else:
+                    raise e
+        raise Exception("[!] Couldn't catch concurrency issues. Please check!")
+
 
     def import_patch_file(self):
         """Import one single patch into the database.
@@ -148,23 +161,33 @@ class PatchFileImporter():
         self._print_indented("[~] Patchfile consists of {} patch/es.".format(number_of_patches))
 
         is_reversed_patch = False
+        import_vulnerable_code = False
 
-        # Iterate over all affected files and copy them into a temporary location.
-        # Copy all affected files into the temporary directory.
-        self._copy_affected_files(patches)
-
-        # Apply this patch to the temporary location.
-        # Fetch adjusted/fuzzed lines in case the patch doesn't match perfectly.
-        fuzzed_line_offsets = self._get_fuzzed_line_offsets(self.patch_filepath)
-        if fuzzed_line_offsets == -1:
-            # This seems to be a patch that should be applied in reverse.
-
-            # TODO: find a nicer solution than to copy all files again here to avoid side effects...
+        # Check if a corresponding directory exists in the same directory.
+        patch_directory = os.path.dirname(self.patch_filepath)
+        patch_name = os.path.basename(self.patch_filepath)
+        patch_raw_name = os.path.splitext(patch_name)[0]
+        patch_vulnerable_code = patch_directory + "/" + patch_raw_name
+        if os.path.isdir(patch_vulnerable_code):
+            # Since vulnerable code already exists we can run a dry patch application on this code.
+            self._copy_affected_files(patches, patch_vulnerable_code)
+            fuzzed_line_offsets = self._apply_patch(self.patch_filepath, False, True)
+            self._print_indented("[!] Patch was not applied as Vulnerable code is already provided for this patch.")
+            import_vulnerable_code = True
+        else:
+            # Iterate over all affected files and copy them into a temporary location.
+            # Copy all affected files into the temporary directory.
             self._copy_affected_files(patches)
 
-            is_reversed_patch = True
-            fuzzed_line_offsets = self._get_fuzzed_line_offsets(self.patch_filepath, True)
-            self._print_indented("[!] This patch was already applied to the project. Treating as reversed patch.")
+            # Apply this patch to the temporary location.
+            # Fetch adjusted/fuzzed lines in case the patch doesn't match perfectly.
+            fuzzed_line_offsets = self._apply_patch(self.patch_filepath)
+            if fuzzed_line_offsets == -1:
+                # This seems to be a patch that should be applied in reverse.
+                self._copy_affected_files(patches)
+                is_reversed_patch = True
+                fuzzed_line_offsets = self._apply_patch(self.patch_filepath, True)
+                self._print_indented("[!] This patch was already applied to the project. Treating as reversed patch.")
 
         #print(temp_dir)
         #time.sleep(30)
@@ -183,7 +206,9 @@ class PatchFileImporter():
         self._query("g.v('{}').linesAdded = {}".format(patch_node_id, patch_linesAdded))
         self._query("g.v('{}').linesRemoved = {}".format(patch_node_id, patch_linesRemoved))
 
+        amount_hunks_contained = 0
         amount_patchfile_connected_nodes = 0
+        amount_patchfile_added_nodes = 0
         patch_i = -1
         # Each patch refers to effects on one single file.
         for patch in patches:
@@ -216,40 +241,56 @@ class PatchFileImporter():
             self._query("g.addEdge(g.v('{}'), g.v('{}'), 'isFile'); g.commit();".format(patch_file_node_id,
                                                                                         file_node_id))
 
-            # TODO: for now we apply patches for reverse patches only... (see TODO below, too)
-            new_file_node_id = "-1"
-            if is_reversed_patch:
-                new_file_node_id = self._apply_patch(self.patch_filepath, patch_file_node_id, patch)
-            else:
-                self._print_indented("[~] Skipping patching for non-reversed patch.", 2)
-
             # Process all hunks contained in the current patch.
             patch_hunks = self._process_patch_hunks(patch, fuzzed_line_offsets, patch_i, is_reversed_patch)
 
             self._print_indented("[!] Effects:", 2)
             self._print_indented(str(patch_hunks), 3)
 
+            if import_vulnerable_code:
+                vulnerable_file_node_id = self._import_patched_file(self.patch_filepath, patch_file_node_id, patch)
+                # TODO: Add support for any effects regarding content being added i.e. handling with patched files.
+                patched_file_node_id = None
+            elif is_reversed_patch:
+                vulnerable_file_node_id = self._import_patched_file(self.patch_filepath, patch_file_node_id, patch)
+                patched_file_node_id = file_node_id
+            else:
+                vulnerable_file_node_id = file_node_id
+                patched_file_node_id = None
+                self._print_indented("[~] Skipping patched (vulnerable) code import for non-reversed patch.", 2)
+
             # Connect the node with all code parts that it affects in the database.
-            amount_connected_nodes = self._connect_patch(patch_file_node_id, file_node_id, patch_hunks,
-                                                         is_reversed_patch, new_file_node_id)
+            (amount_connected_nodes, amount_supposed_added_nodes) = \
+                self._connect_patch(patch_file_node_id, patch_hunks, vulnerable_file_node_id, patched_file_node_id)
 
             amount_patchfile_connected_nodes += amount_connected_nodes
-            if amount_connected_nodes > 0:
-                self._print_indented("[+] Connected patch node with {} AST node/s.".format(
-                    amount_connected_nodes), 2)
+            amount_patchfile_added_nodes += amount_supposed_added_nodes
+            total_effects = amount_connected_nodes + amount_supposed_added_nodes
+            amount_hunks_contained += number_of_hunks
+
+            if total_effects > 0:
+                self._print_indented("[+] Connected patch node with {} CPG node/s (with {} hunks).".format(
+                    amount_connected_nodes, number_of_hunks), 2)
             else:
-                self._print_indented("[-] Patch can't be applied to the current code base.", 2)
+                self._print_indented("[-] Patch can't be connected to any CPG nodes of the current code base.", 2)
                 # Remove patch file node again.
                 self._query("g.v('{}').remove(); g.commit();".format(patch_file_node_id))
 
-        if amount_patchfile_connected_nodes > 0:
+        number_of_total_effects = amount_patchfile_connected_nodes + amount_patchfile_added_nodes
+        if number_of_total_effects > 0:
+            self._print_indented("[+] Patchnode was connected to {} CPG node/s (supposed total {} nodes).".format(
+                    amount_patchfile_connected_nodes, number_of_total_effects))
+            # Compute the average patch hunk complexity by dividing all effects by the number of hunks.
+            average_patch_hunk_complexity = round(number_of_total_effects / amount_hunks_contained, 3)
             self._print_indented(
-                "[+] Patchnode was connected to {} AST node/s.".format(amount_patchfile_connected_nodes))
+                "[!] Average patch hunk complexity is: {} (#total_effects: {} / #hunks_contained: {})".format(
+                    average_patch_hunk_complexity, number_of_total_effects, amount_hunks_contained))
+            self._query("g.v('{}').avgHunkComplexity = {}".format(patch_node_id, average_patch_hunk_complexity))
         else:
-            self._print_indented("[-] Patchfile is not applicable to the current database.")
+            self._print_indented("[-] Patchfile can't be connected to the current database (no effects).")
             # Remove patch node again.
             # TODO: later we should remove this node again...
-            #self._query("g.v('{}').remove(); g.commit();".format(patch_node_id))
+            self._query("g.v('{}').remove(); g.commit();".format(patch_node_id))
         self._print_indented("------------------------------------------------------------")
         self.flush_message_queue()
 
@@ -295,8 +336,9 @@ class PatchFileImporter():
         importer = JoernImporter(self.project_name, import_settings)
         importer.executeImporterPlugin()
 
-    def _get_fuzzed_line_offsets(self, patch_filepath, apply_reversed=False):
-        """Call the Linux "patch" utility on a patchfile to get correct (fuzzed) line starts for all included patches.
+    def _apply_patch(self, patch_filepath, apply_reversed=False, dry_run=False):
+        """Call the Linux "patch" utility on a patchfile to apply a patch and to get correct (fuzzed) line starts for
+        all included (sub)patches.
 
         The current files the patch is supposed to be applied on might have changed over time.
         Hence, we need to tolerate some misalignments regarding line offsets. We let the "patch" utility apply a
@@ -305,6 +347,7 @@ class PatchFileImporter():
         Args:
           patch_filepath: str The patchfile we want to test against our currently existing code base.
           apply_reversed: bool True if the patch is supposed to be applied in reverse.
+          dry_run: bool True if the files are not supposed to be changed (retrieve offsets only mode).
 
         Returns:
             If succeeds a list of lists containing the correct start line offsets for each hunk in a patch is returned.
@@ -319,6 +362,8 @@ class PatchFileImporter():
                                     "-r", os.devnull,
                                     "-d", self.temporary_directory,
                                     "-i", patch_filepath]
+        if dry_run:
+            patch_utility_parameters += ["--dry-run"]
         if apply_reversed:
             patch_utility_parameters += ["-R", "-f"]
 
@@ -494,7 +539,7 @@ class PatchFileImporter():
             hunk_i += 1
         return patch_hunks
 
-    def _copy_affected_files(self, patches):
+    def _copy_affected_files(self, patches, code_base_location=None):
         """Copy all by a patch file affected files into a temporary location.
 
          This method merges the fuzzed line start results with all parsed information contained in this patch hunks.
@@ -502,9 +547,13 @@ class PatchFileImporter():
          Args:
            patches: [Patch] A list of all patches contained in a patch file.
          """
+        use_code_base_location = self.code_base_location
+        if code_base_location:
+            use_code_base_location = code_base_location
+
         # Copy all affected files into a temporary location.
         for patch in patches:
-            original_filepath = self.code_base_location + "/" + patch.path
+            original_filepath = use_code_base_location + "/" + patch.path
             # Skip non-existant files.
             if not os.path.isfile(original_filepath):
                 continue
@@ -515,8 +564,8 @@ class PatchFileImporter():
             shutil.copyfile(original_filepath, temporary_filecopy_path)
 
 
-    def _apply_patch(self, patch_filepath, patch_file_node_id, patch):
-        """Apply a patch and import the patched file into the database.
+    def _import_patched_file(self, patch_filepath, patch_file_node_id, patch):
+        """Import a patched file into the database.
 
          Args:
            patch_filepath: String The path of the original patch.
@@ -551,17 +600,27 @@ class PatchFileImporter():
             patch_file_node_id, new_file_node_id))
         return new_file_node_id
 
-    def _connect_patch(self, patch_file_node_id, file_node_id, patch_hunks, is_reversed_patch, new_file_node_id):
+    def _connect_patch(self, patch_file_node_id, patch_hunks, vulnerable_file_node_id, patched_file_node_id=None):
         """Connect all affected source code nodes with corresponding hunk nodes.
 
+        We require at least one graph database entry for a vulnerable file representation. This representation is then
+        used to connect all "remove" operations. Accordingly, if a patched file version is available, we will connect
+        all "adds" operations, too. This also holds for "replaces" operations where removed content is connected with
+        the vulnerable file and added content with the patched file (if available).
+
        Args:
-         patch_filepath: str The patch's filepath.
+         patch_file_node_id: str A patch file node id i.e. the node representing all effects regarding one file.
+         patch_hunks: [{}] A list of hunk operations.
+         vulnerable_file_node_id: str The id of the corresponding unpatched/vulnerable file version in the database.
+         patched_file_node_id: str The id of the corresponding patched file version in the database.
        """
         amount_connected_nodes = 0
+        amount_supposed_added_nodes = 0
         for hunk_operations in patch_hunks:
             # Create a node for the affected file and connect the patch-node with it.
             new_hunk_node_id = self._query("g.addVertex().id")[0]
             amount_hunk_connected_nodes = 0
+            amount_hunk_supposed_added_nodes = 0
 
             for operation in hunk_operations:
                 # TODO: remove static string here.
@@ -572,36 +631,46 @@ class PatchFileImporter():
                     for metainfo in metainfos:
                         self._query("g.v('{}').{} = {}".format(new_hunk_node_id, metainfo, metainfos[metainfo]))
                     continue
-                affected_segments = hunk_operations[operation]
-                # Connect patch node to original file
-                use_file_node_id = file_node_id
-                if is_reversed_patch:
-                    if operation != 'removes':
-                        use_file_node_id = new_file_node_id
+                affected_hunk_segments = hunk_operations[operation]
 
-                # TODO: add the following if we utilize patched files also for non-reverse patches!
-                #else:
-                #    if operation == 'removes':
-                #        use_file_node_id = new_file_node_id
+                for affected_segment in affected_hunk_segments:
+                    line_number_start = affected_segment[0]
+                    lines_affected = affected_segment[1]
+                    lines_replacement = 0
+                    if operation == 'replaces':
+                        lines_replacement = affected_segment[2]
 
-                for affected_segment in affected_segments:
-                    source_start = affected_segment[0]
-                    source_end = source_start + affected_segment[1] - 1
-                    # TODO: We could include the number of lines added for a replace here, too.
+                    # TODO: For now we don't support content that is being added by patches. However, we are considering
+                    #       how many lines would be added for statistics purposes.
+                    if operation == 'adds':
+                        # Here we would need to check if patched_file_node_id set at all.
+                        amount_hunk_supposed_added_nodes += lines_affected
+                        continue
+                    elif operation == 'replaces':
+                        amount_hunk_supposed_added_nodes += lines_replacement
 
-                    # Retrieve all nodes belonging to a specific source code range and connect them with the patch node.
+                    source_start = line_number_start
+                    source_end = source_start + lines_affected - 1
+
+                    # Connect all code nodes in a specific range with the patch file node.
                     query_connect_patch = "connectPatchWithAffectedCode('{}', '{}', '{}', '{}', {}, {})".format(
-                        patch_file_node_id, use_file_node_id, new_hunk_node_id, operation, source_start, source_end)
-                    affected_nodes = self._query(query_connect_patch)
+                        patch_file_node_id, vulnerable_file_node_id, new_hunk_node_id,
+                        operation, source_start, source_end)
+                    number_of_affected_nodes = int(self._query(query_connect_patch)[0])
 
-                    amount_hunk_connected_nodes += int(affected_nodes[0])
+                    amount_hunk_connected_nodes += number_of_affected_nodes
 
             # Connect the patch file node with the hunk node.
             self._query("g.v('{}').addEdge('applies', g.v('{}'))".format(patch_file_node_id, new_hunk_node_id))
-            # Add the number of connected hunk effects to the number of all connected nodes
+            # Add the number of connected hunk effects to the number of all connected nodes.
             amount_connected_nodes += amount_hunk_connected_nodes
+            # Add the number of all nodes that were supposed to be added.
+            amount_supposed_added_nodes += amount_hunk_supposed_added_nodes
 
-        return amount_connected_nodes
+        #if amount_supposed_added_nodes > 0:
+        #    print("I would add {} nodes. However, not fully supported atm.".format(amount_supposed_added_nodes))
+
+        return (amount_connected_nodes, amount_supposed_added_nodes)
 
 
 
@@ -703,9 +772,13 @@ class PatchImporter():
             self._print_indented("[~] Importing directory: " + import_path)
             self._print_indented("------------------------------------------------------------")
             # Scan directory for patch files to import and start threaded importing.
-            for file in os.listdir(import_path):
-                if not file.endswith(".patch"):
-                    continue
+            # Order all patches by size.
+            patch_files = [[file, os.path.getsize(import_path + "/" + file)]
+                           for file in os.listdir(import_path)
+                           if file.endswith(".patch")]
+            patches_sorted_by_size = sorted(patch_files, key=operator.itemgetter(1))
+            # Iterate over the smallest patches first.
+            for (file,size) in patches_sorted_by_size:
                 patch_path = import_path + '/' + file
                 self._print_indented("[~] Starting thread for: " + patch_path)
                 self.start_new_import_thread(patch_path)

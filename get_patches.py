@@ -3,7 +3,6 @@
 """
 Small utility to retrieve all patches currently available in the database.
 """
-
 from argparse import ArgumentParser
 from octopus.server.python_shell_interface import PythonShellInterface
 from octopus.shell.octopus_shell_utils import reload_dir
@@ -31,8 +30,7 @@ if __name__ == '__main__':
     sys.stdout.close()
     sys.stdout = old_stdout
 
-
-    show_fields = ['id', 'filepath', 'patch_delta', 'is_reversed']
+    show_fields = ['id', 'filepath', 'avgHunkComplexity', 'affected_fucntions', 'is_reversed']
 
     # Get the current code base location.
     patch_nodes_results = dbConnection.runGremlinQuery('get_all_patches()')
