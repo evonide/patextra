@@ -68,6 +68,7 @@ class PatchFileImporter():
                         self.j.shell_connection.run_command(f.read())
 
     def _init_db(self):
+
         self.j.connectToDatabase()
         # TODO: replace this ugly code once a nicer way to load steps is available.
         if FORCE_STEPS_LOAD:
@@ -123,6 +124,18 @@ class PatchFileImporter():
                     raise e
         raise Exception("[!] Couldn't catch concurrency issues. Please check!")
 
+    def _get_patch_file_descripiton(self, patch_filepath):
+        """Reads out the header of a given patch file."""
+        patch_description = ""
+        with open(self.patch_filepath) as f:
+            lines = f.readlines()
+
+            for line in lines:
+                if line.startswith("diff "):
+                    break
+                patch_description += line
+        patch_description = patch_description.strip()
+        return patch_description
 
     def import_patch_file(self):
         """Import one single patch into the database.
@@ -143,8 +156,10 @@ class PatchFileImporter():
         self._print_indented("[~] Importing: " + self.patch_filepath + " - ", 0, 1)
 
         # Create a node for this patch if it doesn't already exist.
-        patch_description = 'Description tba.'
-        patch_node_id = self._query("createPatchNode('{}', '{}')".format(self.patch_filepath, patch_description))[0]
+        patch_description = self._get_patch_file_descripiton(self.patch_filepath)
+        if "$/" in patch_description or "/$" in patch_description:
+            raise Exception("Invalid content detected in patch description. Please adjust the code to support this.")
+        patch_node_id = self._query("createPatchNode('{}', $/{}/$)".format(self.patch_filepath, patch_description))[0]
 
         if not patch_node_id:
             raise Exception("[!] Can't create a new node.")
@@ -708,6 +723,8 @@ class PatchImporter():
         self._print_indented("[~] Using code base location: " + self.code_base_location)
         # An array storing all running importer threads.
         self.import_threads = []
+        # Ensure that the patch index was built.
+        self._query("createPatchIndex()")
 
     def _query(self, query):
         """Emit a Gremlin query."""

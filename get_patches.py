@@ -30,7 +30,7 @@ if __name__ == '__main__':
     sys.stdout.close()
     sys.stdout = old_stdout
 
-    show_fields = ['id', 'filepath', 'avgHunkComplexity', 'affected_fucntions', 'is_reversed']
+    show_fields = ['id', 'filepath', 'avgHunkComplexity', 'affected_functions', 'is_reversed']
 
     # Get the current code base location.
     patch_nodes_results = dbConnection.runGremlinQuery('get_all_patches()')

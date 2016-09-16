@@ -155,6 +155,7 @@ class NodeExtrapolator(AccTool):
             it._().backwardSlice(symbols, %d).id.toList().join("\\n")
         }
         """ % (node_id, slicing_precision)
+        print(slice_query)
         return self._querySlicing(slice_query)
 
     def _sliceForwards(self, node_id, slicing_precision=SLICING_PDG_PRECISION):
@@ -227,8 +228,8 @@ class NodeExtrapolator(AccTool):
 
     def slice_and_resolve_code(self, sink_node_id):
         #self._print("Slicing node: " + str(sink_node_id))
-        #sink_slice_node_ids = self._sliceBackwards(sink_node_id)
-        sink_slice_node_ids = self._sliceForwards(sink_node_id)
+        sink_slice_node_ids = self._sliceBackwards(sink_node_id)
+        #sink_slice_node_ids = self._sliceForwards(sink_node_id)
         #print(sink_slice_node_ids)
         #exit()
         #sink_slice_node_ids = self._sliceBidrectional(sink_node_id)
@@ -305,9 +306,9 @@ class NodeExtrapolator(AccTool):
             sys.exit()
         self._print("[+] Retrieved sink symbol: " + sink_symbol)
 
-        #code_symbols = self.slice_and_resolve_code(node_id)
-        #print(code_symbols)
-        #exit()
+        code_symbols = self.slice_and_resolve_code(node_id)
+        print(code_symbols)
+        exit()
 
         # 1) Retrieve all interesting sink nodes
         sink_node_ids = self._getSimilarSinkNodeIDs(sink_symbol)
