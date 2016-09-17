@@ -41,7 +41,8 @@ class PatchExtrapolator(AccTool):
         # Load additional groovy files (mute any output in the meantime).
         old_stdout = sys.stdout
         sys.stdout = open(os.devnull, "w")
-        reload_dir(self.dbInterface.j.shell_connection, "steps")
+        dir_path = os.path.dirname(os.path.realpath(__file__)) + "/steps"
+        reload_dir(self.dbInterface.j.shell_connection, dir_path)
         sys.stdout.close()
         sys.stdout = old_stdout
         self.stepsLoaded = True

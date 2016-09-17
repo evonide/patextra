@@ -306,9 +306,9 @@ class NodeExtrapolator(AccTool):
             sys.exit()
         self._print("[+] Retrieved sink symbol: " + sink_symbol)
 
-        code_symbols = self.slice_and_resolve_code(node_id)
-        print(code_symbols)
-        exit()
+        #code_symbols = self.slice_and_resolve_code(node_id)
+        #print(code_symbols)
+        #exit()
 
         # 1) Retrieve all interesting sink nodes
         sink_node_ids = self._getSimilarSinkNodeIDs(sink_symbol)

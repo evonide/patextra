@@ -4,6 +4,7 @@
 A script that is supposed to import/integrate a patch or a directory of patches into the database. Only affected files
 will be connected with created patch nodes. Further, existing patches will be updated when re-running this process.
 """
+from setuptools import extension
 
 from unidiff import PatchSet
 from argparse import ArgumentParser
@@ -31,7 +32,7 @@ PATCH_EXTRAPOLATION_DIRECTORY = "patch-extrapolation"
 PATCH_PARSED_DIRECTORY = "parsed"
 
 # Multithreading support.
-MAX_NUMBER_THREADS = 12
+MAX_NUMBER_THREADS = 8
 
 DESCRIPTION = """Import all security patches from a specific directory/file and integrate those into the database."""
 
@@ -59,7 +60,8 @@ class PatchFileImporter():
         self.temporary_directory = self.temporary_directory_object.name
 
     def _init_steps(self):
-        for dirpath, dirnames, filenames in os.walk("steps"):
+        dir_path = os.path.dirname(os.path.realpath(__file__)) + "/steps"
+        for dirpath, dirnames, filenames in os.walk(dir_path):
             filenames[:] = [f for f in filenames if not f.startswith('.')]
             for filename in filenames:
                 _, ext = os.path.splitext(filename)
@@ -121,6 +123,9 @@ class PatchFileImporter():
                     #print("[!] -------- Concurrency error. Retrying... --------")
                     continue
                 else:
+                    print("[-] Query failed: {}".format(query))
+                    self.flush_message_queue()
+                    print("------------")
                     raise e
         raise Exception("[!] Couldn't catch concurrency issues. Please check!")
 
@@ -209,19 +214,22 @@ class PatchFileImporter():
 
         # Store some meta information about this patch.
         self._query("g.v('{}').reversed = \"{}\"".format(patch_node_id, is_reversed_patch))
-        self._query("g.v('{}').numAffectedFiles = {}".format(patch_node_id, number_of_patches))
+        self._query("g.v('{}').originalFilesAffected = {}".format(patch_node_id, number_of_patches))
 
         # TODO: merge this loop and the one below...
-        patch_linesAdded = 0
-        patch_linesRemoved = 0
+        patch_original_lines_added = 0
+        patch_original_lines_removed = 0
+        patch_original_hunks = 0
         for patch in patches:
-            patch_linesAdded += patch.added
-            patch_linesRemoved += patch.removed
+            patch_original_lines_added += patch.added
+            patch_original_lines_removed += patch.removed
+            patch_original_hunks += len(patch)
         # TODO: remove static string "linesAdded" here...
-        self._query("g.v('{}').linesAdded = {}".format(patch_node_id, patch_linesAdded))
-        self._query("g.v('{}').linesRemoved = {}".format(patch_node_id, patch_linesRemoved))
+        self._query("g.v('{}').originalLinesAdded = {}".format(patch_node_id, patch_original_lines_added))
+        self._query("g.v('{}').originalLinesRemoved = {}".format(patch_node_id, patch_original_lines_removed))
+        self._query("g.v('{}').originalHunks = {}".format(patch_node_id, patch_original_hunks))
 
-        amount_hunks_contained = 0
+        amount_hunks_successful = 0
         amount_patchfile_connected_nodes = 0
         amount_patchfile_added_nodes = 0
         patch_i = -1
@@ -231,33 +239,43 @@ class PatchFileImporter():
 
             filepath = self.code_base_location + "/" + patch.path
             number_of_hunks = len(patch)
-            self._print_indented("[->] " + filepath + " (" + str(number_of_hunks) + " hunk/s) - ", 1, 1)
+            self._print_indented("[->] " + filepath + " (" + str(number_of_hunks) + " hunk/s)", 1, 1)
 
-            # TODO: I have no idea why we need to do this. OrientDB is giving us a hard time with indices :(.
-            filepath = filepath[-100:]
-            results = self._query("queryFileByPath('{}', true).toList().id".format(filepath))
-            # TODO: remove this == [''] once the OrientDB Gremlin "List instead element" return mystery is resolved.
+            file_node_id = -1
+            if import_vulnerable_code:
+                extension = os.path.splitext(filepath)[1]
+                # TODO: very ugly workaround. We need a way to check if the current file really contains code.
+                if extension in [".c", ".cpp", ".h"]:
+                    # We don't need to search for the file inside the database.
+                    self._print_indented(" - importing from local file")
+                else:
+                    self._print_indented(" - invalid extension: {}, skipping".format(extension))
+                    continue
+            else:
+                # TODO: I have no idea why we need to do this. OrientDB is giving us a hard time with indices :(.
+                filepath = filepath[-100:]
+                results = self._query("queryFileByPath('{}', true).toList().id".format(filepath))
+                # TODO: remove this == [''] once the OrientDB Gremlin "List instead element" return mystery is resolved.
 
-            # Check if this file exists in the code base.
-            if len(results) == 0 or results == ['']:
-                self._print_indented("skipped (not found)")
-                continue
-            elif len(results) > 1:
-                raise Exception("The file: " + filepath + " exists more than once in the database.")
-            file_node_id = results[0]
-            self._print_indented("resolved ({})".format(file_node_id))
+                # Check if this file exists in the code base (only if not provided by extracted repository content).
+                if len(results) == 0 or results == ['']:
+                    self._print_indented(" skipped (not found)")
+                    continue
+                elif len(results) > 1:
+                    raise Exception("The file: " + filepath + " exists more than once in the database.")
+                file_node_id = results[0]
+                self._print_indented(" - resolved ({})".format(file_node_id))
 
             # Create a node for the affected file and connect the patch-node with it.
             patch_file_node_id = self._query("g.addVertex().id")[0]
             # Connect the patch with this newly created patch file node.
             self._query("g.addEdge(g.v('{}'), g.v('{}'), 'affects'); g.commit();".format(patch_node_id,
                                                                                          patch_file_node_id))
-            # Connect the patch file node with the corresponding affected file node.
-            self._query("g.addEdge(g.v('{}'), g.v('{}'), 'isFile'); g.commit();".format(patch_file_node_id,
-                                                                                        file_node_id))
+
 
             # Process all hunks contained in the current patch.
             patch_hunks = self._process_patch_hunks(patch, fuzzed_line_offsets, patch_i, is_reversed_patch)
+            hunks_successful = len(patch_hunks)
 
             self._print_indented("[!] Effects:", 2)
             self._print_indented(str(patch_hunks), 3)
@@ -266,6 +284,7 @@ class PatchFileImporter():
                 vulnerable_file_node_id = self._import_patched_file(self.patch_filepath, patch_file_node_id, patch)
                 # TODO: Add support for any effects regarding content being added i.e. handling with patched files.
                 patched_file_node_id = None
+                file_node_id = vulnerable_file_node_id
             elif is_reversed_patch:
                 vulnerable_file_node_id = self._import_patched_file(self.patch_filepath, patch_file_node_id, patch)
                 patched_file_node_id = file_node_id
@@ -274,6 +293,10 @@ class PatchFileImporter():
                 patched_file_node_id = None
                 self._print_indented("[~] Skipping patched (vulnerable) code import for non-reversed patch.", 2)
 
+            # Connect the patch file node with the corresponding affected file node.
+            self._query("g.addEdge(g.v('{}'), g.v('{}'), 'isFile'); g.commit();".format(patch_file_node_id,
+                                                                                        file_node_id))
+
             # Connect the node with all code parts that it affects in the database.
             (amount_connected_nodes, amount_supposed_added_nodes) = \
                 self._connect_patch(patch_file_node_id, patch_hunks, vulnerable_file_node_id, patched_file_node_id)
@@ -281,11 +304,11 @@ class PatchFileImporter():
             amount_patchfile_connected_nodes += amount_connected_nodes
             amount_patchfile_added_nodes += amount_supposed_added_nodes
             total_effects = amount_connected_nodes + amount_supposed_added_nodes
-            amount_hunks_contained += number_of_hunks
+            amount_hunks_successful += hunks_successful
 
             if total_effects > 0:
-                self._print_indented("[+] Connected patch node with {} CPG node/s (with {} hunks).".format(
-                    amount_connected_nodes, number_of_hunks), 2)
+                self._print_indented("[+] Connected patch node with {} CPG node/s (with {} applied hunks).".format(
+                    amount_connected_nodes, hunks_successful), 2)
             else:
                 self._print_indented("[-] Patch can't be connected to any CPG nodes of the current code base.", 2)
                 # Remove patch file node again.
@@ -295,17 +318,28 @@ class PatchFileImporter():
         if number_of_total_effects > 0:
             self._print_indented("[+] Patchnode was connected to {} CPG node/s (supposed total {} nodes).".format(
                     amount_patchfile_connected_nodes, number_of_total_effects))
+
+            # Save some statistics about this patch.
+            self._query("pn = g.v('{}'); pn.actualFilesAffected = pn.out.toList().size".format(patch_node_id))
+            self._query("g.v('{}').actualLinesAdded = {}".format(patch_node_id, amount_patchfile_added_nodes))
+            self._query("g.v('{}').actualLinesRemoved = {}".format(patch_node_id, amount_patchfile_connected_nodes))
+            self._query("g.v('{}').actualHunks = {}".format(patch_node_id, amount_hunks_successful))
+
             # Compute the average patch hunk complexity by dividing all effects by the number of hunks.
-            average_patch_hunk_complexity = round(number_of_total_effects / amount_hunks_contained, 3)
+            average_patch_hunk_complexity = round(number_of_total_effects / amount_hunks_successful, 3)
             self._print_indented(
                 "[!] Average patch hunk complexity is: {} (#total_effects: {} / #hunks_contained: {})".format(
-                    average_patch_hunk_complexity, number_of_total_effects, amount_hunks_contained))
+                    average_patch_hunk_complexity, number_of_total_effects, amount_hunks_successful))
             self._query("g.v('{}').avgHunkComplexity = {}".format(patch_node_id, average_patch_hunk_complexity))
         else:
             self._print_indented("[-] Patchfile can't be connected to the current database (no effects).")
+            self._query("g.v('{}').actualFilesAffected = 0".format(patch_node_id))
+            self._query("g.v('{}').actualLinesAdded = 0".format(patch_node_id))
+            self._query("g.v('{}').actualLinesRemoved = 0".format(patch_node_id))
+            self._query("g.v('{}').actualHunks = 0".format(patch_node_id))
             # Remove patch node again.
             # TODO: later we should remove this node again...
-            self._query("g.v('{}').remove(); g.commit();".format(patch_node_id))
+            #self._query("g.v('{}').remove(); g.commit();".format(patch_node_id))
         self._print_indented("------------------------------------------------------------")
         self.flush_message_queue()
 
@@ -707,7 +741,8 @@ class PatchImporter():
         # TODO: replace this ugly code once a nicer way to load steps is available.
         old_stdout = sys.stdout
         sys.stdout = open(os.devnull, "w")
-        reload_dir(self.j.shell_connection, "steps")
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        reload_dir(self.j.shell_connection, dir_path + "/steps")
         sys.stdout.close()
         sys.stdout = old_stdout
         # ------------------------------------------------------------------------

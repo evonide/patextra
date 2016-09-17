@@ -85,7 +85,7 @@ get_all_patches = {
         number_of_affected_functions = callees.size();
     }._().transform {
         "" + it.id + "\t" + it.filepath + "\t" + it.avgHunkComplexity + "\t" + number_of_affected_functions +
-                      "\t" + it.reversed //+ "\n" +  it.description
+                      "\t" + it.reversed + "\t" + it.originalHunks //+ "\n" +  it.description
     }
 }
 

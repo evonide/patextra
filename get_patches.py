@@ -26,17 +26,18 @@ if __name__ == '__main__':
     # Load additional groovy files (mute any output in the meantime).
     old_stdout = sys.stdout
     sys.stdout = open(os.devnull, "w")
-    reload_dir(dbConnection.shell_connection, "steps")
+    dir_path = os.path.dirname(os.path.realpath(__file__)) + "/steps"
+    reload_dir(dbConnection.shell_connection, dir_path)
     sys.stdout.close()
     sys.stdout = old_stdout
 
-    show_fields = ['id', 'filepath', 'avgHunkComplexity', 'affected_functions', 'is_reversed']
+    show_fields = ['id', 'filepath', 'avgHunkComplexity', 'affected_functions', 'is_reversed', 'originalHunks']
 
     # Get the current code base location.
-    patch_nodes_results = dbConnection.runGremlinQuery('get_all_patches()')
     for field in show_fields:
         sys.stdout.write(field + "\t")
     print("")
+    patch_nodes_results = dbConnection.runGremlinQuery('get_all_patches()')
     for patch_node_result in patch_nodes_results:
         patch_infos = patch_node_result.split("\t")
         for info in patch_infos:
