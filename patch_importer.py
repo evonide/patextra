@@ -326,10 +326,16 @@ class PatchFileImporter():
             self._query("g.v('{}').actualHunks = {}".format(patch_node_id, amount_hunks_successful))
 
             # Compute the average patch hunk complexity by dividing all effects by the number of hunks.
-            average_patch_hunk_complexity = round(number_of_total_effects / amount_hunks_successful, 3)
+            original_total_effects = patch_original_lines_added + patch_original_lines_removed
+            average_patch_hunk_complexity = round(original_total_effects / patch_original_hunks, 3)
             self._print_indented(
-                "[!] Average patch hunk complexity is: {} (#total_effects: {} / #hunks_contained: {})".format(
-                    average_patch_hunk_complexity, number_of_total_effects, amount_hunks_successful))
+                "[!] Average original patch hunk complexity is: {} (#total_effects: {} / #hunks_contained: {})".format(
+                    average_patch_hunk_complexity, original_total_effects, patch_original_hunks))
+            # TODO: we might want to use the actual average patch hunk complexity instead.
+            #average_patch_hunk_complexity = round(number_of_total_effects / amount_hunks_successful, 3)
+            #self._print_indented(
+            #    "[!] Average patch hunk complexity is: {} (#total_effects: {} / #hunks_contained: {})".format(
+            #        average_patch_hunk_complexity, number_of_total_effects, amount_hunks_successful))
             self._query("g.v('{}').avgHunkComplexity = {}".format(patch_node_id, average_patch_hunk_complexity))
         else:
             self._print_indented("[-] Patchfile can't be connected to the current database (no effects).")

@@ -32,8 +32,12 @@ if __name__ == '__main__':
     sys.stdout = old_stdout
 
     print("[~] Imported patch statistics for project: {}".format(projectName))
-    imported_patches = dbConnection.runGremlinQuery('queryPatchIndex("/.*patch/").toList().size')[0]
-    print("[~] Currently imported patches: {}\n".format(imported_patches))
+    imported_patches = int(dbConnection.runGremlinQuery('queryPatchIndex("/.*patch/").toList().size')[0])
+    print("[~] Currently imported patches: {}".format(imported_patches))
+    active_patches = int(dbConnection.runGremlinQuery(
+        'queryPatchIndex("/.*patch/").filter{it.out("affects").toList().size > 0}.toList().size')[0])
+    print("[~] Currently active patches: {}".format(active_patches))
+    print("[~] Ratio: " + str(round(active_patches/imported_patches, 2)))
     show_fields  = ['actualFilesAffected', 'originalFilesAffected']
     show_fields += ['actualLinesAdded', 'originalLinesAdded']
     show_fields += ['actualLinesRemoved', 'originalLinesRemoved']
